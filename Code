@@ -1,0 +1,341 @@
+// ESP32 BRUSHED QUADCOPTER — Wi‑Fi Web Joystick + Altitude Hold (BMP280)
+// Hardware: ESP32 + MPU6050 + BMP280 + 4x 716 brushed via L9110S
+// Angle (self-level) + Yaw rate + Alt-hold
+//
+// ====== WHAT'S NEW ======
+// • Open 192.168.4.1 → on‑screen dual joysticks
+// • Left stick: Throttle (sets altitude target) + Yaw   |  Right stick: Roll + Pitch
+// • Altitude hold using BMP280 with filtering + PID; throttle stick sets the target altitude (0..10 m)
+// • Failsafe: stop motors if no command >500 ms
+//
+// ====== LIBRARIES ======
+// Built‑in: WiFi.h, WebServer.h, Wire.h
+// External: Adafruit_BMP280 (for BMP280) — install via Library Manager
+// NOTE: WebSockets avoided to keep dependencies minimal. Page POSTs /cmd at ~25–30 Hz.
+//
+// ====== PINOUT (provided by user) ======
+// L9110S (forward‑only): PWM on "A", hold "B" LOW.
+// M1 front-left   : M1_A=19 (PWM), M1_B=23 (LOW)
+// M2 front-right  : M2_A=18 (PWM), M2_B=5  (LOW)
+// M3 rear-right   : M3_A=25 (PWM), M3_B=26 (LOW)
+// M4 rear-left    : M4_A=27 (PWM), M4_B=14 (LOW)
+// I2C: SDA=21, SCL=22
+//
+// ====== NOTES ======
+// • Start WITHOUT props. Verify IMU angles & web controls first.
+// • Hover throttle varies by weight; start with HOVER_THR ≈ 0.35 ~ 0.55 for tiny brushed builds.
+// • PWM 12 kHz, 10‑bit. Angle limits ±20°. Tune PIDs as needed.
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+
+// ====== Motor Pins ======
+#define M1_A 19
+#define M1_B 23
+#define M2_A 18
+#define M2_B 5
+#define M3_A 25
+#define M3_B 26
+#define M4_A 27
+#define M4_B 14
+
+// ====== PWM (LEDC) ======
+const int PWM_FREQ = 12000; // 12 kHz
+const int PWM_RES  = 10;    // 10-bit
+const int CH_M1 = 0, CH_M2 = 1, CH_M3 = 2, CH_M4 = 3;
+
+// ====== Wi‑Fi AP + Web ======
+const char* AP_SSID = "ESP-Fly";
+const char* AP_PASS = "12345678n"; // change later
+WebServer server(80);
+
+// ====== IMU (MPU6050) ======
+#define MPU6050_ADDR 0x68
+float gyroOffsetX=0, gyroOffsetY=0, gyroOffsetZ=0;
+float angleRol=0, anglePit=0;
+
+// ====== BMP280 ======
+Adafruit_BMP280 bmp; bool bmpOK=false;
+float altFilt=0.0f;  // filtered altitude (m)
+float altTarget=0.0f; // target altitude (m)
+const float ALT_MAX = 10.0f; // user’s indoor max
+
+// ====== PID Gains ======
+// Angle outer → desired rate (P only is sufficient initially)
+float Kp_ang = 3.0f;
+
+// Rate inner (roll/pitch)
+float Kp_rate=0.24f, Ki_rate=0.10f, Kd_rate=0.0012f;
+
+// Yaw rate
+float Kp_yaw =0.22f, Ki_yaw=0.06f, Kd_yaw=0.0f;
+
+// Altitude PID → throttle correction (additive around hover)
+float Kp_alt=1.0f, Ki_alt=0.15f, Kd_alt=0.00f;
+float i_alt=0, lastAltErr=0;
+
+// Integrators & state
+float i_rate_rol=0, i_rate_pit=0, i_rate_yaw=0;
+float lastErrRol=0, lastErrPit=0, lastErrYaw=0;
+
+// Throttle/hover
+float HOVER_THR = 0.42f;  // tune to your build (0..1)
+float baseThr = 0.0f;     // dynamic from alt PID
+
+// Command inputs from web (normalized)
+volatile float cmdRol=0, cmdPit=0, cmdYaw=0, cmdAlt=0; // -1..1 for r/p/y, 0..1 for altitude request
+volatile bool armed=false; // web UI arm/disarm
+
+// Timing
+unsigned long lastMicros=0; unsigned long lastCmdMs=0;
+
+// ====== Helpers ======
+float constrainf_(float v, float lo, float hi){return v<lo?lo:(v>hi?hi:v);} 
+
+void mpuWrite(uint8_t r, uint8_t v){ Wire.beginTransmission(MPU6050_ADDR); Wire.write(r); Wire.write(v); Wire.endTransmission(); }
+void readMPU(int16_t &ax,int16_t &ay,int16_t &az,int16_t &gx,int16_t &gy,int16_t &gz){
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x3B); Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR,14,true);
+  ax=(Wire.read()<<8)|Wire.read(); ay=(Wire.read()<<8)|Wire.read(); az=(Wire.read()<<8)|Wire.read();
+  Wire.read(); Wire.read(); // temp
+  gx=(Wire.read()<<8)|Wire.read(); gy=(Wire.read()<<8)|Wire.read(); gz=(Wire.read()<<8)|Wire.read();
+}
+
+void calibrateGyro(){ const int N=2000; long sx=0,sy=0,sz=0; for(int i=0;i<N;i++){int16_t ax,ay,az,gx,gy,gz; readMPU(ax,ay,az,gx,gy,gz); sx+=gx; sy+=gy; sz+=gz; delay(2);} gyroOffsetX=sx/(float)N; gyroOffsetY=sy/(float)N; gyroOffsetZ=sz/(float)N; }
+
+void setupMotor(int pinPWM,int pinLO,int ch){ pinMode(pinLO,OUTPUT); digitalWrite(pinLO,LOW); ledcSetup(ch,PWM_FREQ,PWM_RES); ledcAttachPin(pinPWM,ch); ledcWrite(ch,0);} 
+void writeMotor(int ch,int v){ v=constrain(v,0,(1<<PWM_RES)-1); ledcWrite(ch,v);} 
+
+// ====== Web UI (simple joystick page) ======
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no"><title>ESP32 Drone</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial;margin:0;background:#0b0f14;color:#eaeef2}
+.wrap{display:grid;gap:14px;padding:14px}
+.card{background:#121821;border:1px solid #1c2633;border-radius:16px;padding:14px;box-shadow:0 6px 30px rgba(0,0,0,.25)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.stick{position:relative;aspect-ratio:1/1;border-radius:16px;background:#0e141b;border:1px solid #1b2533}
+.pad{position:absolute;inset:10%;border-radius:12px;background:#0a0f15;border:1px dashed #2b394d}
+.knob{position:absolute;width:28%;aspect-ratio:1;border-radius:50%;left:36%;top:36%;background:#1f2a38;border:1px solid #2b3a4d;touch-action:none}
+.btns{display:flex;gap:10px;align-items:center}
+button{background:#1a90ff;border:none;color:white;padding:10px 14px;border-radius:10px;font-weight:600}
+.ind{font-size:12px;color:#9fb3c8}
+</style></head><body><div class=wrap>
+<div class=card>
+  <div class=btns>
+    <button id=arm>ARM</button>
+    <button id=disarm style="background:#e5484d">DISARM</button>
+    <div class=ind>status: <span id=st>disarmed</span> • RSS: <span id=rss>-</span></div>
+  </div>
+</div>
+<div class="card row">
+  <div class=stick id=left><div class=pad></div><div class=knob></div><div class=ind>Left: Throttle/Altitude + Yaw</div></div>
+  <div class=stick id=right><div class=pad></div><div class=knob></div><div class=ind>Right: Roll + Pitch</div></div>
+</div>
+<div class=card>
+  <div class=ind>Tip: center left stick to HOLD altitude; up/down to climb/descend. Right stick for attitude.</div>
+</div>
+<script>
+const st=document.getElementById('st');
+let armed=false; let lastSend=0;
+function stick(el,cb){
+  const knob=el.querySelector('.knob');
+  let w=el.clientWidth,h=el.clientHeight; let cx=w/2, cy=h/2; let r=w*0.34; let down=false;
+  const set=(x,y)=>{knob.style.left=(x-0.14*w)+'px'; knob.style.top=(y-0.14*h)+'px'}; set(cx,cy);
+  function norm(x,y){return [(x-cx)/r,(cy-y)/r]} // [-1,1]
+  function clamp(v){return Math.max(-1,Math.min(1,v))}
+  el.addEventListener('pointerdown',e=>{down=true;el.setPointerCapture(e.pointerId)});
+  el.addEventListener('pointermove',e=>{if(!down)return;const rect=el.getBoundingClientRect();let x=e.clientX-rect.left,y=e.clientY-rect.top;let [nx,ny]=norm(x,y);let m=Math.hypot(nx,ny);if(m>1){nx/=m;ny/=m;}
+    set(cx+nx*r, cy-ny*r); cb(nx,ny);
+  });
+  el.addEventListener('pointerup',()=>{down=false; set(cx,cy); cb(0,0)});
+  window.addEventListener('resize',()=>{w=el.clientWidth;h=el.clientHeight;cx=w/2;cy=h/2;r=w*0.34; set(cx,cy)});
+}
+let L={x:0,y:0}, R={x:0,y:0};
+stick(document.getElementById('left'), (x,y)=>{L={x,y}});
+stick(document.getElementById('right'),(x,y)=>{R={x,y}});
+async function send(){
+  const now=performance.now();
+  if(now-lastSend<35){requestAnimationFrame(send);return;} // ~28 Hz
+  lastSend=now;
+  const body = new URLSearchParams({
+    r:R.x.toFixed(3), p:R.y.toFixed(3), y:L.x.toFixed(3), a:((L.y+1)/2).toFixed(3), arm: armed?"1":"0"
+  });
+  try{ await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}); document.getElementById('rss').textContent='ok'; }
+  catch(e){ document.getElementById('rss').textContent='lost'; }
+  requestAnimationFrame(send);
+}
+send();
+
+document.getElementById('arm').onclick=()=>{armed=true; st.textContent='armed'};
+document.getElementById('disarm').onclick=()=>{armed=false; st.textContent='disarmed'};
+</script>
+</div></body></html>
+)HTML";
+
+// ====== HTTP Handlers ======
+void handleRoot(){ server.send_P(200, "text/html", INDEX_HTML); }
+void handleCmd(){
+  if(!server.hasArg("r")||!server.hasArg("p")||!server.hasArg("y")||!server.hasArg("a")||!server.hasArg("arm")){
+    server.send(400,"text/plain","bad args"); return;
+  }
+  cmdRol = constrainf_(server.arg("r").toFloat(), -1, 1);
+  cmdPit = constrainf_(server.arg("p").toFloat(), -1, 1);
+  cmdYaw = constrainf_(server.arg("y").toFloat(), -1, 1);
+  cmdAlt = constrainf_(server.arg("a").toFloat(), 0, 1); // 0..1 → 0..ALT_MAX m
+  armed  = (server.arg("arm")=="1");
+  lastCmdMs = millis();
+  server.send(200,"text/plain","ok");
+}
+
+// ====== SETUP ======
+void setup(){
+  Serial.begin(115200);
+  Wire.begin(21,22);
+
+  // IMU
+  // Wake MPU6050: ±250 dps, ±2g
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x6B); Wire.write(0x00); Wire.endTransmission();
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x1B); Wire.write(0x00); Wire.endTransmission();
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x1C); Wire.write(0x00); Wire.endTransmission();
+  delay(100);
+  Serial.println("Calibrating gyro... keep still");
+  calibrateGyro();
+
+  // BMP280
+  bmpOK = bmp.begin(0x76);
+  if(!bmpOK) bmpOK = bmp.begin(0x77);
+  if(bmpOK){
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X2,
+                    Adafruit_BMP280::SAMPLING_X16,
+                    Adafruit_BMP280::FILTER_X16,
+                    Adafruit_BMP280::STANDBY_MS_63);
+    altFilt = bmp.readAltitude(1013.25);
+    altTarget = altFilt;
+  } else {
+    Serial.println("BMP280 not found — altitude hold disabled");
+  }
+
+  // Motors
+  setupMotor(M1_A,M1_B,CH_M1); setupMotor(M2_A,M2_B,CH_M2); setupMotor(M3_A,M3_B,CH_M3); setupMotor(M4_A,M4_B,CH_M4);
+
+  // Wi‑Fi AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // Web routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/cmd", HTTP_POST, handleCmd);
+  server.begin();
+
+  lastMicros = micros(); lastCmdMs = millis();
+}
+
+// ====== LOOP ======
+void loop(){
+  server.handleClient();
+
+  // Failsafe: stop if no command for 500 ms
+  bool linkOK = (millis()-lastCmdMs) < 500;
+
+  // dt
+  unsigned long now = micros(); float dt = (now-lastMicros)*1e-6f; if(dt<=0) dt=0.001f; lastMicros=now;
+
+  // Read IMU
+  int16_t ax,ay,az,gx,gy,gz; readMPU(ax,ay,az,gx,gy,gz);
+  const float AXS=16384.0f, GYS=131.0f; // ±2g, ±250 dps
+  float axg=ax/AXS, ayg=ay/AXS, azg=az/AXS;
+  float gxds=(gx-gyroOffsetX)/GYS, gyds=(gy-gyroOffsetY)/GYS, gzds=(gz-gyroOffsetZ)/GYS;
+
+  // Complementary filter
+  float accRol = atan2f(ayg, azg) * 57.2958f;
+  float accPit = atan2f(-axg, sqrtf(ayg*ayg + azg*azg)) * 57.2958f;
+  const float alpha=0.98f; angleRol = alpha*(angleRol + gxds*dt) + (1.0f-alpha)*accRol; anglePit = alpha*(anglePit + gyds*dt) + (1.0f-alpha)*accPit;
+
+  // Altitude (if available)
+  if(bmpOK){
+    float alt = bmp.readAltitude(1013.25);
+    const float aAlt=0.90f; altFilt = aAlt*altFilt + (1.0f-aAlt)*alt; // low‑pass
+    // Map web cmd to target altitude, or hold last if armed and link ok
+    altTarget = ALT_MAX * cmdAlt; // 0..ALT_MAX m
+  }
+
+  // Outer angle loop
+  float maxAngle=20.0f; // deg
+  float targRol = cmdRol * maxAngle;
+  float targPit = cmdPit * maxAngle;
+  float desRateRol = Kp_ang * (targRol - angleRol);
+  float desRatePit = Kp_ang * (targPit - anglePit);
+  float targYawRate = cmdYaw * 120.0f; // deg/s
+
+  // Inner rate PID
+  float errRateRol = desRateRol - gxds;
+  float errRatePit = desRatePit - gyds;
+  float errRateYaw = targYawRate - gzds;
+
+  float iMax=200.0f;
+  i_rate_rol = constrainf_(i_rate_rol + errRateRol*dt, -iMax, iMax);
+  i_rate_pit = constrainf_(i_rate_pit + errRatePit*dt, -iMax, iMax);
+  i_rate_yaw = constrainf_(i_rate_yaw + errRateYaw*dt, -iMax, iMax);
+
+  float dRol=(errRateRol-lastErrRol)/dt; float dPit=(errRatePit-lastErrPit)/dt; float dYaw=(errRateYaw-lastErrYaw)/dt;
+  lastErrRol=errRateRol; lastErrPit=errRatePit; lastErrYaw=errRateYaw;
+
+  float outRol=Kp_rate*errRateRol + Ki_rate*i_rate_rol + Kd_rate*dRol;
+  float outPit=Kp_rate*errRatePit + Ki_rate*i_rate_pit + Kd_rate*dPit;
+  float outYaw=Kp_yaw *errRateYaw + Ki_yaw *i_rate_yaw + Kd_yaw *dYaw;
+
+  // Alt-hold PID → base throttle
+  if(armed && linkOK && bmpOK){
+    float errAlt = altTarget - altFilt; // meters
+    i_alt = constrainf_(i_alt + errAlt*dt, -0.8f, 0.8f);
+    float dAlt = (errAlt - lastAltErr)/dt; lastAltErr = errAlt;
+    float corr = Kp_alt*errAlt + Ki_alt*i_alt + Kd_alt*dAlt; // throttle delta
+    baseThr = constrainf_(HOVER_THR + corr, 0.0f, 0.95f);
+  } else {
+    // Disarmed or no link → stop
+    baseThr = 0.0f; i_alt=0; lastAltErr=0; i_rate_rol=i_rate_pit=i_rate_yaw=0;
+  }
+
+  // Mixer (X)
+  float mixScale=0.0025f;
+  float r=outRol*mixScale, p=outPit*mixScale, y=outYaw*mixScale;
+  float m1=baseThr - r - p - y; // FL
+  float m2=baseThr + r - p + y; // FR
+  float m3=baseThr + r + p - y; // RR
+  float m4=baseThr - r + p + y; // RL
+
+  // Constrain & PWM
+  int pwm1=(int)(constrainf_(m1,0.0f,1.0f)*((1<<PWM_RES)-1));
+  int pwm2=(int)(constrainf_(m2,0.0f,1.0f)*((1<<PWM_RES)-1));
+  int pwm3=(int)(constrainf_(m3,0.0f,1.0f)*((1<<PWM_RES)-1));
+  int pwm4=(int)(constrainf_(m4,0.0f,1.0f)*((1<<PWM_RES)-1));
+
+  // Hard safety: disarm or lost link
+  if(!armed || !linkOK){ pwm1=pwm2=pwm3=pwm4=0; }
+
+  writeMotor(CH_M1,pwm1); writeMotor(CH_M2,pwm2); writeMotor(CH_M3,pwm3); writeMotor(CH_M4,pwm4);
+
+  // Debug @ ~25 Hz
+  static uint32_t t=0; if(millis()-t>40){ t=millis();
+    Serial.print("angR:");Serial.print(angleRol,1);
+    Serial.print(",angP:");Serial.print(anglePit,1);
+    if(bmpOK){ Serial.print(",alt:"); Serial.print(altFilt,2); Serial.print(",tgt:"); Serial.print(altTarget,2);} else { Serial.print(",alt:NaN,tgt:NaN"); }
+    Serial.print(",thr:"); Serial.print(baseThr,3);
+    Serial.print(",pwm:"); Serial.print(pwm1); Serial.print(','); Serial.print(pwm2); Serial.print(','); Serial.print(pwm3); Serial.print(','); Serial.println(pwm4);
+  }
+}
+
+// ====== MOTOR TEST (optional) ======
+/*
+void loop(){
+  writeMotor(CH_M1,400); delay(800); writeMotor(CH_M1,0); delay(400);
+  writeMotor(CH_M2,400); delay(800); writeMotor(CH_M2,0); delay(400);
+  writeMotor(CH_M3,400); delay(800); writeMotor(CH_M3,0); delay(400);
+  writeMotor(CH_M4,400); delay(800); writeMotor(CH_M4,0); delay(1200);
+}
+*/
